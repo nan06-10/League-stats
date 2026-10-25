@@ -29,7 +29,14 @@ def load_data():
     # Load CSV Database
     try:
         df_csv_raw = pd.read_csv('2026_LoL_esports_match_data_from_OraclesElixir.csv', low_memory=False)
-        df_csv_team = df_csv_raw[df_csv_raw['position'] == 'team']
+        df_csv_team = df_csv_raw[df_csv_raw['position'] == 'team'].copy()
+        
+        # FIX: Oracles Elixir doesn't have an 'opponent' column. We must calculate it by matching the two teams in the same game.
+        if 'opponent' not in df_csv_team.columns:
+            df_csv_team['opponent'] = df_csv_team.groupby('gameid')['teamname'].transform(
+                lambda x: x.iloc[::-1].values if len(x) == 2 else [None] * len(x)
+            )
+
         df_csv = pd.DataFrame({
             'match_date': pd.to_datetime(df_csv_team['date']).dt.strftime('%Y-%m-%d'),
             'game_id': df_csv_team['gameid'], 'league': df_csv_team['league'],
