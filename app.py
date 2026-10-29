@@ -9,9 +9,10 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="LoL Esports Intel", page_icon="🎮", layout="centered")
 st.title("🏆 LoL Pro Match Predictor")
 
-# 2. Load and Cache Data (Runs only once)
-@st.cache_data
+# 2. Load and Cache Data (Refreshes automatically every 1 hour from the live server)
+@st.cache_data(ttl=3600)
 def load_data():
+    # Load SQLite Database (Your local historical data)
     conn = sqlite3.connect('league_database.sqlite')
     query = """
         SELECT 
@@ -26,10 +27,13 @@ def load_data():
     df_sql = pd.read_sql_query(query, conn)
     conn.close()
 
+    # Load CSV Database directly from Oracles Elixir Live Server
     try:
-        df_csv_raw = pd.read_csv('2026_LoL_esports_match_data_from_OraclesElixir.csv', low_memory=False)
+        csv_url = 'https://oracleselixir-downloadable-match-data.s3.us-west-2.amazonaws.com/2026_LoL_esports_match_data_from_OraclesElixir.csv'
+        df_csv_raw = pd.read_csv(csv_url, low_memory=False)
         df_csv_team = df_csv_raw[df_csv_raw['position'] == 'team'].copy()
         
+        # FIX: Calculate the opponent column dynamically
         if 'opponent' not in df_csv_team.columns:
             df_csv_team['opponent'] = df_csv_team.groupby('gameid')['teamname'].transform(
                 lambda x: x.iloc[::-1].values if len(x) == 2 else [None] * len(x)
@@ -44,16 +48,19 @@ def load_data():
             'first_blood': df_csv_team['firstblood'].apply(lambda x: 1 if str(x) in ['1', '1.0', 'True', 'TRUE'] else 0),
             'early_frags': df_csv_team['killsat10'] if 'killsat10' in df_csv_team.columns else None
         })
-    except FileNotFoundError:
+    except Exception as e:
         df_csv = pd.DataFrame()
 
+    # Combine Data
     master_df = pd.concat([df_sql, df_csv]).drop_duplicates(subset=['game_id', 'team_name']).dropna(subset=['team_name'])
     
+    # Active Major Teams Filter
     major_leagues = ['LPL', 'LCK', 'LEC', 'LCS', 'LTA', 'LCP', 'WCS', 'MSI']
     banned_leagues = ['LCKC', 'LIT', 'ROL', 'HLL', 'AL', 'NLC', 'Academy', 'Challengers', 'NACL', 'LDL', 'LFL', 'PRM', 'Cup']
     master_df = master_df[master_df['league'].str.contains('|'.join(major_leagues), case=False, na=False)]
     master_df = master_df[~master_df['league'].str.contains('|'.join(banned_leagues), case=False, na=False)]
     
+    # Active Teams Filter (Played in the last 120 days)
     master_df['match_date'] = pd.to_datetime(master_df['match_date'], errors='coerce')
     latest_db_date = master_df['match_date'].max()
     team_last_match = master_df.groupby('team_name')['match_date'].max()
@@ -62,25 +69,21 @@ def load_data():
     
     return master_df
 
-# 3. Train Machine Learning Model (Runs once)
+# 3. Train Machine Learning Model (Runs once during boot)
 @st.cache_resource
 def train_ml_model(df):
-    # Sort chronologically to calculate past averages correctly
     ml_df = df.sort_values(by=['team_name', 'match_date', 'game_id'], ascending=True).copy()
     
-    # Feature Engineering: 5-game rolling averages (ignoring the current game to prevent data leakage)
+    # Feature Engineering: 5-game rolling averages (prevents data leakage)
     ml_df['rolling_win_rate'] = ml_df.groupby('team_name')['result'].transform(lambda x: x.apply(lambda y: 1 if y == 'Win' else 0).shift(1).rolling(5, min_periods=1).mean())
     ml_df['rolling_avg_frags'] = ml_df.groupby('team_name')['frags'].transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
     ml_df['rolling_early_frags'] = ml_df.groupby('team_name')['early_frags'].transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
     
-    # Drop rows without enough history
     ml_df = ml_df.dropna(subset=['rolling_win_rate', 'rolling_avg_frags', 'rolling_early_frags'])
     
-    # Define Inputs (X) and Output (y)
     X = ml_df[['rolling_win_rate', 'rolling_avg_frags', 'rolling_early_frags']]
     y = ml_df['result'].apply(lambda x: 1 if x == 'Win' else 0)
     
-    # Train the Random Forest
     model = RandomForestClassifier(n_estimators=100, random_state=42)
     if not X.empty:
         model.fit(X, y)
@@ -88,11 +91,11 @@ def train_ml_model(df):
     return model, ml_df
 
 # Load data and train model visually
-with st.spinner('Loading Databases & Training ML Engine...'):
+with st.spinner('Downloading Live Data & Training ML Engine...'):
     master_df = load_data()
     ml_model, ml_features_df = train_ml_model(master_df)
     
-    # Sort master_df backwards for the UI so newest games show first
+    # Sort backwards for the UI so newest games show first
     master_df = master_df.sort_values(by='match_date', ascending=False)
     available_teams = sorted(master_df['team_name'].unique())
 
@@ -108,19 +111,17 @@ if st.button("Generate Intel & Prediction", use_container_width=True):
     team_df = master_df[master_df['team_name'] == primary_team].copy()
     team_df['win_val'] = (team_df['result'] == 'Win').astype(int)
     
-    # Predict future win probability using the ML model
+    # Predict future win probability
     team_ml_history = ml_features_df[ml_features_df['team_name'] == primary_team]
     ml_prediction_text = "Not enough data for ML prediction."
     
     if not team_ml_history.empty:
-        # Get their most recent playstyle stats
         latest_stats = team_ml_history.iloc[-1]
         X_predict = [[latest_stats['rolling_win_rate'], latest_stats['rolling_avg_frags'], latest_stats['rolling_early_frags']]]
         
-        # Calculate Probability
         win_prob = ml_model.predict_proba(X_predict)[0][1] * 100
         
-        if win_prob > 50:
+        if win_prob >= 50:
             ml_prediction_text = f"🟢 FAVORED: {win_prob:.1f}% chance to win their next generic match."
         else:
             ml_prediction_text = f"🔴 UNDERDOG: {win_prob:.1f}% chance to win their next generic match."
