@@ -1,6 +1,7 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -8,10 +9,9 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="LoL Esports Intel", page_icon="🎮", layout="centered")
 st.title("🏆 LoL Pro Match Predictor")
 
-# 2. Load and Cache Data (Runs only once to keep the app lightning fast)
+# 2. Load and Cache Data (Runs only once)
 @st.cache_data
 def load_data():
-    # Load SQLite Database
     conn = sqlite3.connect('league_database.sqlite')
     query = """
         SELECT 
@@ -26,12 +26,10 @@ def load_data():
     df_sql = pd.read_sql_query(query, conn)
     conn.close()
 
-    # Load CSV Database
     try:
         df_csv_raw = pd.read_csv('2026_LoL_esports_match_data_from_OraclesElixir.csv', low_memory=False)
         df_csv_team = df_csv_raw[df_csv_raw['position'] == 'team'].copy()
         
-        # FIX: Oracles Elixir doesn't have an 'opponent' column. We must calculate it by matching the two teams in the same game.
         if 'opponent' not in df_csv_team.columns:
             df_csv_team['opponent'] = df_csv_team.groupby('gameid')['teamname'].transform(
                 lambda x: x.iloc[::-1].values if len(x) == 2 else [None] * len(x)
@@ -49,42 +47,85 @@ def load_data():
     except FileNotFoundError:
         df_csv = pd.DataFrame()
 
-    # Combine Data
     master_df = pd.concat([df_sql, df_csv]).drop_duplicates(subset=['game_id', 'team_name']).dropna(subset=['team_name'])
     
-    # Active Major Teams Filter
     major_leagues = ['LPL', 'LCK', 'LEC', 'LCS', 'LTA', 'LCP', 'WCS', 'MSI']
     banned_leagues = ['LCKC', 'LIT', 'ROL', 'HLL', 'AL', 'NLC', 'Academy', 'Challengers', 'NACL', 'LDL', 'LFL', 'PRM', 'Cup']
     master_df = master_df[master_df['league'].str.contains('|'.join(major_leagues), case=False, na=False)]
     master_df = master_df[~master_df['league'].str.contains('|'.join(banned_leagues), case=False, na=False)]
     
-    # Active Teams Filter (Played in the last 120 days)
     master_df['match_date'] = pd.to_datetime(master_df['match_date'], errors='coerce')
     latest_db_date = master_df['match_date'].max()
     team_last_match = master_df.groupby('team_name')['match_date'].max()
     active_teams = team_last_match[team_last_match >= (latest_db_date - pd.Timedelta(days=120))].index
     master_df = master_df[master_df['team_name'].isin(active_teams)]
     
-    return master_df.sort_values(by='match_date', ascending=False)
+    return master_df
 
-# Load data into the app visually
-with st.spinner('Loading Databases...'):
+# 3. Train Machine Learning Model (Runs once)
+@st.cache_resource
+def train_ml_model(df):
+    # Sort chronologically to calculate past averages correctly
+    ml_df = df.sort_values(by=['team_name', 'match_date', 'game_id'], ascending=True).copy()
+    
+    # Feature Engineering: 5-game rolling averages (ignoring the current game to prevent data leakage)
+    ml_df['rolling_win_rate'] = ml_df.groupby('team_name')['result'].transform(lambda x: x.apply(lambda y: 1 if y == 'Win' else 0).shift(1).rolling(5, min_periods=1).mean())
+    ml_df['rolling_avg_frags'] = ml_df.groupby('team_name')['frags'].transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+    ml_df['rolling_early_frags'] = ml_df.groupby('team_name')['early_frags'].transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+    
+    # Drop rows without enough history
+    ml_df = ml_df.dropna(subset=['rolling_win_rate', 'rolling_avg_frags', 'rolling_early_frags'])
+    
+    # Define Inputs (X) and Output (y)
+    X = ml_df[['rolling_win_rate', 'rolling_avg_frags', 'rolling_early_frags']]
+    y = ml_df['result'].apply(lambda x: 1 if x == 'Win' else 0)
+    
+    # Train the Random Forest
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    if not X.empty:
+        model.fit(X, y)
+        
+    return model, ml_df
+
+# Load data and train model visually
+with st.spinner('Loading Databases & Training ML Engine...'):
     master_df = load_data()
+    ml_model, ml_features_df = train_ml_model(master_df)
+    
+    # Sort master_df backwards for the UI so newest games show first
+    master_df = master_df.sort_values(by='match_date', ascending=False)
     available_teams = sorted(master_df['team_name'].unique())
 
-# 3. User Interface (Dropdown Menus)
+# 4. User Interface
 col1, col2 = st.columns(2)
 with col1:
     primary_team = st.selectbox("Select Primary Team:", available_teams)
 with col2:
     h2h_opponent = st.selectbox("Select H2H Opponent:", ["None"] + available_teams)
 
-# 4. Search Logic
-if st.button("Generate Intel Report", use_container_width=True):
+# 5. Search & Predict Logic
+if st.button("Generate Intel & Prediction", use_container_width=True):
     team_df = master_df[master_df['team_name'] == primary_team].copy()
     team_df['win_val'] = (team_df['result'] == 'Win').astype(int)
     
-    # Group games into Series (BO3 / BO5)
+    # Predict future win probability using the ML model
+    team_ml_history = ml_features_df[ml_features_df['team_name'] == primary_team]
+    ml_prediction_text = "Not enough data for ML prediction."
+    
+    if not team_ml_history.empty:
+        # Get their most recent playstyle stats
+        latest_stats = team_ml_history.iloc[-1]
+        X_predict = [[latest_stats['rolling_win_rate'], latest_stats['rolling_avg_frags'], latest_stats['rolling_early_frags']]]
+        
+        # Calculate Probability
+        win_prob = ml_model.predict_proba(X_predict)[0][1] * 100
+        
+        if win_prob > 50:
+            ml_prediction_text = f"🟢 FAVORED: {win_prob:.1f}% chance to win their next generic match."
+        else:
+            ml_prediction_text = f"🔴 UNDERDOG: {win_prob:.1f}% chance to win their next generic match."
+
+    # Group games into Series
     series_df = team_df.groupby(['match_date', 'opponent']).agg(
         games_played=('game_id', 'count'), wins=('win_val', 'sum'),
         avg_frags=('frags', 'mean'), avg_early_frags=('early_frags', 'mean')
@@ -102,6 +143,10 @@ if st.button("Generate Intel Report", use_container_width=True):
     
     # Build Text Output Block
     out = []
+    
+    out.append(f"🤖 ML PREDICTION ENGINE")
+    out.append(ml_prediction_text)
+    out.append("\n" + "="*40 + "\n")
     
     # --- OVERALL STATS ---
     series_wins = len(series_df[series_df['outcome'] == 'WIN'])
